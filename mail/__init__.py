@@ -171,7 +171,7 @@ def _gmail_get(access, path):
     req = urllib.request.Request(
         f"https://gmail.googleapis.com/gmail/v1/users/me{path}",
         headers={"Authorization": f"Bearer {access}"})
-    with urllib.request.urlopen(req, timeout=60) as resp:
+    with urllib.request.urlopen(req, timeout=600) as resp:
         return json.loads(resp.read().decode())
 
 

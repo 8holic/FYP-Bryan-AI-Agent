@@ -49,7 +49,7 @@ def _request(path, data=None):
     headers = {"Content-Type": "application/json"}
     body = json.dumps(data).encode() if data is not None else None
     req = urllib.request.Request(OLLAMA_HOST + path, data=body, headers=headers)
-    with urllib.request.urlopen(req, timeout=180) as resp:
+    with urllib.request.urlopen(req, timeout=600) as resp:
         return json.loads(resp.read().decode())
 
 
