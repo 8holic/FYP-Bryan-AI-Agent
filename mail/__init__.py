@@ -262,6 +262,7 @@ def poll_once_gmail(env, model):
                    for h in payload.get("headers", [])}
         sender = headers.get("from", "")
         subject = headers.get("subject", "")
+        print(f"Reading email from {sender}: {subject}")
         body = mime_text(payload)
         image_text = ocr_images(payload)
         if image_text:
