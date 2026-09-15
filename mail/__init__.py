@@ -1,10 +1,7 @@
 import base64
 import datetime
-import email as email_module
-import getpass
 import html
 import http.server
-import imaplib
 import json
 import os
 import re
@@ -14,91 +11,69 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
-from email.header import decode_header
 
 import llm
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ENV_FILE = os.path.join(HERE, ".env")
 SEEN_FILE = os.path.join(HERE, ".gmail_seen.json")
+SUMMARY_FILE = os.path.join(HERE, ".mailbox_summary.md")
 
 _tok = {"access": None, "exp": 0}
+_summary_lock = threading.Lock()
+_last_flush_date = None
 
 
-def decode_text(value):
-    if not value:
-        return ""
-    parts = decode_header(value)
-    out = []
-    for part, charset in parts:
-        if isinstance(part, bytes):
-            out.append(part.decode(charset or "utf-8", errors="replace"))
-        else:
-            out.append(part)
-    return "".join(out)
-
-
-def decode_payload(part):
-    payload = part.get_payload(decode=True)
-    if not payload:
-        return ""
-    charset = part.get_content_charset() or "utf-8"
-    return payload.decode(charset, errors="replace")
-
-
-def body_of(msg):
-    if msg.is_multipart():
-        for part in msg.walk():
-            if part.get_content_type() == "text/plain":
-                text = decode_payload(part)
-                if text:
-                    return text
-        for part in msg.walk():
-            if part.get_content_type() == "text/html":
-                text = decode_payload(part)
-                if text:
-                    return html.unescape(re.sub(r"<[^>]+>", " ", text))
-    return decode_payload(msg)
-
-
-def summarize(model, sender, subject, body):
+def analyze(model, sender, subject, body):
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
     prompt = (
-        "Summarize the following email in 3-5 short sentences. Include what it is about, "
-        "who it is from, and any deadline, date, or amount of money mentioned.\n\n"
+        f"Current date and time: {now}\n"
+        "Triage this email for Bryan. Decide if it is urgent, then summarize it.\n"
+        "URGENT = needs immediate attention: a deadline within a day or two, security or account "
+        "alerts, payment or billing problems, a time-sensitive request from a real person, or "
+        "anything that loses money or an opportunity if missed.\n"
+        "NON-URGENT = newsletters, promotions, receipts, FYI, social notifications, routine updates.\n\n"
+        "Reply with JSON only: "
+        '{"urgent": true or false, "summary": "3-5 short sentences covering what it is about, who it '
+        'is from, and any deadline, date or amount of money mentioned."}\n\n'
         f"From: {sender}\nSubject: {subject}\n\n{body}"
     )
-    return llm.chat(model, prompt, system=llm.SYSTEM_PROMPT or llm.DEFAULT_SYSTEM_PROMPT)
+    raw = llm.chat(model, prompt, fmt="json")
+    try:
+        data = json.loads(raw)
+        return bool(data.get("urgent")), str(data.get("summary", "")).strip()
+    except (ValueError, AttributeError):
+        return False, raw.strip()
 
 
-def notify(env, sender, subject, summary):
-    text = f"Email: {subject}\nFrom: {sender}\n\n{summary}"
+def notify(env, sender, subject, summary, urgent=False):
+    prefix = "URGENT - " if urgent else "Email: "
+    text = f"{prefix}{subject}\nFrom: {sender}\n\n{summary}"
     llm.send(env["TELEGRAM_TOKEN"], env["TELEGRAM_CHAT_ID"], text)
 
 
-def connect(env):
-    mail = imaplib.IMAP4_SSL(env["EMAIL_HOST"])
-    mail.login(env["EMAIL_USER"], env["EMAIL_PASSWORD"])
-    mail.select(env.get("EMAIL_MAILBOX", "INBOX"))
-    return mail
+def append_summary(sender, subject, summary):
+    stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    entry = f"## {stamp} | {sender} | {subject}\n{summary}\n\n"
+    with _summary_lock:
+        with open(SUMMARY_FILE, "a", encoding="utf-8") as f:
+            f.write(entry)
 
 
-def poll_once_imap(env, mail, model):
-    typ, data = mail.search(None, "UNSEEN")
-    if typ != "OK":
-        return
-    for num in data[0].split():
-        typ, msg_data = mail.fetch(num, "(RFC822)")
-        if typ != "OK":
-            continue
-        msg = email_module.message_from_bytes(msg_data[0][1])
-        sender = decode_text(msg.get("From"))
-        subject = decode_text(msg.get("Subject"))
-        body = body_of(msg)[:4000]
-        print(f"New email from {sender}: {subject}")
-        summary = summarize(model, sender, subject, body)
-        print(f"> {summary}")
-        notify(env, sender, subject, summary)
-        mail.store(num, "+FLAGS", "\\Seen")
+def flush_summary(env):
+    global _last_flush_date
+    with _summary_lock:
+        if not os.path.exists(SUMMARY_FILE):
+            return False
+        with open(SUMMARY_FILE, encoding="utf-8") as f:
+            text = f.read().strip()
+        if not text:
+            return False
+        # ponytail: one Telegram message, 4096-char cap; chunk or sendDocument if the day's summary exceeds it
+        llm.send(env["TELEGRAM_TOKEN"], env["TELEGRAM_CHAT_ID"], text)
+        os.remove(SUMMARY_FILE)
+        _last_flush_date = datetime.date.today()
+        return True
 
 
 def _oauth_token(params):
@@ -235,6 +210,44 @@ def mime_text(payload):
     return ""
 
 
+def image_parts(payload):
+    if not payload:
+        return []
+    out = []
+    if payload.get("mimeType", "").startswith("image/") and payload.get("body", {}).get("data"):
+        out.append(payload["body"]["data"])
+    for part in payload.get("parts", []) or []:
+        out.extend(image_parts(part))
+    return out
+
+
+_ocr = None
+
+
+def ocr_images(payload):
+    global _ocr
+    data_list = image_parts(payload)
+    if not data_list:
+        return ""
+    try:
+        from rapidocr_onnxruntime import RapidOCR
+    except ImportError:
+        print("rapidocr-onnxruntime not installed, skipping image OCR")
+        return ""
+    if _ocr is None:
+        _ocr = RapidOCR()
+    lines = []
+    for data in data_list:
+        try:
+            result, _ = _ocr(base64.urlsafe_b64decode(data))
+        except Exception as e:
+            print(f"OCR error: {e}")
+            continue
+        if result:
+            lines.extend(line[1] for line in result)
+    return "\n".join(lines)
+
+
 def poll_once_gmail(env, model):
     seen = load_seen()
     start = (datetime.date.today() - datetime.timedelta(days=1)).strftime("%Y/%m/%d")
@@ -249,46 +262,31 @@ def poll_once_gmail(env, model):
                    for h in payload.get("headers", [])}
         sender = headers.get("from", "")
         subject = headers.get("subject", "")
-        body = mime_text(payload)[:4000]
-        print(f"New email from {sender}: {subject}")
-        summary = summarize(model, sender, subject, body)
-        print(f"> {summary}")
-        notify(env, sender, subject, summary)
+        body = mime_text(payload)
+        image_text = ocr_images(payload)
+        if image_text:
+            body += "\n\n[Image text]\n" + image_text
+        urgent, summary = analyze(model, sender, subject, body[:4000])
+        print(f"{'URGENT' if urgent else 'Mail'} from {sender}: {subject}")
+        if urgent:
+            notify(env, sender, subject, summary, urgent=True)
+        else:
+            append_summary(sender, subject, summary)
         seen.add(mid)
         seen = save_seen(seen)
 
 
 def ensure_email_env():
     env = llm.env_items(ENV_FILE)
-    changed = False
-    if env.get("GMAIL_CLIENT_ID"):
-        if not env.get("GMAIL_CLIENT_SECRET"):
-            print("Add GMAIL_CLIENT_SECRET=<your client secret> to .env, then run again.")
-            return
-        if not env.get("GMAIL_REFRESH_TOKEN"):
-            print("Need to authorize the Gmail account once.")
-            env["GMAIL_REFRESH_TOKEN"] = consent(env)
-            changed = True
-        if not env.get("GMAIL_REFRESH_TOKEN"):
-            print("Need to authorize the Gmail account once.")
-            env["GMAIL_REFRESH_TOKEN"] = consent(env)
-            changed = True
-    else:
-        for key, prompt, secret in (
-            ("EMAIL_HOST", "Email IMAP server (e.g. imap.gmail.com or outlook.office365.com): ", False),
-            ("EMAIL_USER", "Email address: ", False),
-            ("EMAIL_PASSWORD", "Email app password: ", True),
-        ):
-            if not env.get(key):
-                value = getpass.getpass(prompt).strip() if secret else input(prompt).strip()
-                env[key] = value
-                changed = True
-    if "TELEGRAM_CHAT_ID" not in env or not env.get("TELEGRAM_CHAT_ID"):
-        value = input("Your Telegram chat id (Enter to skip, auto-saved on first message): ").strip()
-        if value:
-            env["TELEGRAM_CHAT_ID"] = value
-            changed = True
-    if changed:
+    if not env.get("GMAIL_CLIENT_ID"):
+        print("Add GMAIL_CLIENT_ID and GMAIL_CLIENT_SECRET to .env, then run again.")
+        return
+    if not env.get("GMAIL_CLIENT_SECRET"):
+        print("Add GMAIL_CLIENT_SECRET=<your client secret> to .env, then run again.")
+        return
+    if not env.get("GMAIL_REFRESH_TOKEN"):
+        print("Need to authorize the Gmail account once.")
+        env["GMAIL_REFRESH_TOKEN"] = consent(env)
         llm.write_env(ENV_FILE, env)
         print(f"Saved to {ENV_FILE}")
 
@@ -301,18 +299,13 @@ def poll_gmail_once(env, model):
 
 
 def run_poller():
+    global _last_flush_date
     warned = False
+    needed = ("GMAIL_CLIENT_SECRET", "GMAIL_REFRESH_TOKEN",
+              "TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID")
     while True:
         env = llm.env_items(ENV_FILE)
         llm.load_env_file(ENV_FILE)
-        if env.get("GMAIL_CLIENT_ID"):
-            needed = ("GMAIL_CLIENT_SECRET", "GMAIL_REFRESH_TOKEN",
-                      "TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID")
-            poller = poll_gmail_once
-        else:
-            needed = ("EMAIL_HOST", "EMAIL_USER", "EMAIL_PASSWORD",
-                      "TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID")
-            poller = poll_imap_once
         missing = [k for k in needed if not env.get(k)]
         model = llm.OLLAMA_MODEL
         if not missing and not model:
@@ -331,14 +324,12 @@ def run_poller():
             time.sleep(10)
             continue
         warned = False
-        poller(env, model)
+        poll_gmail_once(env, model)
+        today = datetime.date.today()
+        if datetime.datetime.now().hour >= 8 and _last_flush_date != today:
+            try:
+                flush_summary(env)
+            except Exception as e:
+                print(f"Summary flush error: {e}")
+            _last_flush_date = today
         time.sleep(int(env.get("EMAIL_POLL_SECONDS", "60")))
-
-
-def poll_imap_once(env, model):
-    try:
-        mail = connect(env)
-        poll_once_imap(env, mail, model)
-        mail.logout()
-    except Exception as e:
-        print(f"Poll error: {e}")

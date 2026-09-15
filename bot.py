@@ -2,6 +2,7 @@ import os
 import sys
 
 import llm
+import mail
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ENV_FILE = os.path.join(HERE, ".env")
@@ -18,8 +19,6 @@ def ensure_env():
         ("TELEGRAM_CHAT_ID", "Your chat id (Enter to skip, auto-saved on first message): ", ""),
         ("OLLAMA_HOST", "Ollama host (Enter for localhost): ", "http://localhost:11434"),
         ("OLLAMA_MODEL", "Model name to use (Enter to auto-pick first installed): ", ""),
-        ("OLLAMA_API_KEY", "", ""),
-        ("SYSTEM_PROMPT", "", ""),
     ):
         if key not in env:
             if prompt:
@@ -51,7 +50,7 @@ def main():
     env = ensure_env()
     TOKEN = env["TELEGRAM_TOKEN"]
     llm.load_env_file(ENV_FILE)
-    system_prompt = llm.SYSTEM_PROMPT or llm.DEFAULT_SYSTEM_PROMPT
+    system_prompt = llm.DEFAULT_SYSTEM_PROMPT
 
     model = llm.OLLAMA_MODEL
     available = []
@@ -89,7 +88,6 @@ def main():
                 llm.write_env(ENV_FILE, env)
                 print(f"Saved chat id {chat_id} to {ENV_FILE}")
 
-            llm.send(TOKEN, chat_id, "Thanks for your message! We will get back to you as soon as possible")
             if text == "/start":
                 llm.send(TOKEN, chat_id, f"Connected to local model: {model}. Send a message.")
                 continue
@@ -103,6 +101,10 @@ def main():
                     llm.send(TOKEN, chat_id, f"Switched to {model}")
                 else:
                     llm.send(TOKEN, chat_id, f"Not installed: {name}. Available: {', '.join(available) or 'none'}")
+                continue
+            if "mailbox" in text.lower():
+                if not mail.flush_summary(llm.env_items(ENV_FILE)):
+                    llm.send(TOKEN, chat_id, "No new mail to summarize.")
                 continue
             try:
                 reply = llm.chat(model, text, system=system_prompt)

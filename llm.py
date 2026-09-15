@@ -4,13 +4,15 @@ import urllib.request
 
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "")
-OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY", "")
 OLLAMA_CONTEXT_LENGTH = 0
-SYSTEM_PROMPT = ""
 DEFAULT_SYSTEM_PROMPT = (
-    "You are the assistant of Bryan, with a friendly relationship with Bryan. "
-    "You are allowed to be talkative and engage with what Bryan has said, "
-    "keep your response under 500 words"
+    "You are Bryan's personal assistant bot running on Telegram, connected to his email. "
+    "Your job is to triage his incoming mail: urgent messages are sent to him immediately, "
+    "non-urgent ones are collected into a summary he can request by sending the word 'mailbox', "
+    "or that is sent automatically every morning at 8am. "
+    "When Bryan mentions 'my mailbox' or 'my mail', he means his email inbox. "
+    "Answer only what he asked, in a few short sentences. No emojis, no filler, no inventing "
+    "details. If you do not know something, say so in one line."
 )
 
 
@@ -33,24 +35,18 @@ def write_env(path, items):
 
 
 def load_env_file(path):
-    global OLLAMA_HOST, OLLAMA_MODEL, OLLAMA_API_KEY, OLLAMA_CONTEXT_LENGTH, SYSTEM_PROMPT
+    global OLLAMA_HOST, OLLAMA_MODEL, OLLAMA_CONTEXT_LENGTH
     for key, value in env_items(path).items():
         if key == "OLLAMA_HOST":
             OLLAMA_HOST = value
         elif key == "OLLAMA_MODEL":
             OLLAMA_MODEL = value
-        elif key == "OLLAMA_API_KEY":
-            OLLAMA_API_KEY = value
         elif key == "OLLAMA_CONTEXT_LENGTH":
             OLLAMA_CONTEXT_LENGTH = int(value) if value.isdigit() else 0
-        elif key == "SYSTEM_PROMPT":
-            SYSTEM_PROMPT = value
 
 
 def _request(path, data=None):
     headers = {"Content-Type": "application/json"}
-    if OLLAMA_API_KEY:
-        headers["Authorization"] = f"Bearer {OLLAMA_API_KEY}"
     body = json.dumps(data).encode() if data is not None else None
     req = urllib.request.Request(OLLAMA_HOST + path, data=body, headers=headers)
     with urllib.request.urlopen(req, timeout=180) as resp:
@@ -62,10 +58,12 @@ def models():
     return [m["name"] for m in tags.get("models", [])]
 
 
-def chat(model, message, system=None):
+def chat(model, message, system=None, fmt=None):
     payload = {"model": model, "stream": False}
     if OLLAMA_CONTEXT_LENGTH:
         payload["options"] = {"num_ctx": OLLAMA_CONTEXT_LENGTH}
+    if fmt:
+        payload["format"] = fmt
     messages = []
     if system:
         messages.append({"role": "system", "content": system})
