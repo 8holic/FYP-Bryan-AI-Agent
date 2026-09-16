@@ -5,8 +5,8 @@ A local AI assistant that watches a Gmail inbox and reports to Telegram, powered
 ## What it does
 
 - Polls Gmail for new unread mail (last 24h, promotions excluded).
-- Triages each email with the local model: **urgent** mail is pushed to Telegram immediately; **non-urgent** mail is collected into a summary file.
-- Flushes the summary on demand (Telegram `/mailbox`) or automatically at **08:00** local time, then clears the file.
+- Classifies each email with the local model: **urgent** mail is summarized and pushed to Telegram immediately; **non-urgent** mail is queued as a compact note (sender, subject, snippet).
+- Flushes the queue on demand (Telegram `/mailbox`) or automatically at **08:00** local time: **one** model call turns the whole batch into a single digest, then the queue is cleared.
 - OCRs inline images in emails (RapidOCR) and feeds the extracted text to the model, so image-only mail still gets summarized.
 - Doubles as a Telegram chat bot backed by the same local model.
 
@@ -93,7 +93,7 @@ On Windows: `.\.venv\Scripts\python.exe main.py`.
 | `/start` | show the connected model |
 | `/chatid` | print your chat id |
 | `/model <name>` | switch model |
-| `/mailbox` | send the collected non-urgent summary now (any message containing "mailbox" works) |
+| `/mailbox` | send a digest of the collected non-urgent mail now (any message containing "mailbox" works) |
 
 ## Notes
 

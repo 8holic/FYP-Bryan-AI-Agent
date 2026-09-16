@@ -1,5 +1,8 @@
+import json
 import os
 import sys
+import time
+import urllib.error
 
 import llm
 import mail
@@ -45,6 +48,36 @@ def get_updates(offset):
     })["result"]
 
 
+def poll_updates(offset):
+    delay = 5
+    while True:
+        try:
+            return get_updates(offset)
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                wait = 5
+                try:
+                    wait = json.loads(e.read().decode())["parameters"]["retry_after"]
+                except Exception:
+                    pass
+                print(f"Telegram rate limit; waiting {wait}s")
+                time.sleep(wait)
+            elif e.code == 401:
+                print("Telegram rejected the token (401). Check TELEGRAM_TOKEN in .env.")
+                time.sleep(60)
+            elif e.code == 409:
+                print("Telegram conflict (409): another bot instance is polling. Stop the other one.")
+                time.sleep(60)
+            else:
+                print(f"Telegram error {e.code}; retrying in {delay}s")
+                time.sleep(delay)
+                delay = min(delay * 2, 60)
+        except Exception as e:
+            print(f"Telegram poll error: {e}; retrying in {delay}s")
+            time.sleep(delay)
+            delay = min(delay * 2, 60)
+
+
 def main():
     global TOKEN
     env = ensure_env()
@@ -72,7 +105,7 @@ def main():
 
     offset = 0
     while True:
-        for update in get_updates(offset):
+        for update in poll_updates(offset):
             offset = update["update_id"] + 1
             message = update.get("message")
             if not message or "text" not in message:
@@ -103,7 +136,12 @@ def main():
                     llm.send(TOKEN, chat_id, f"Not installed: {name}. Available: {', '.join(available) or 'none'}")
                 continue
             if "mailbox" in text.lower():
-                if not mail.flush_summary(llm.env_items(ENV_FILE)):
+                try:
+                    sent = mail.flush_summary(llm.env_items(ENV_FILE), model)
+                except Exception as e:
+                    llm.send(TOKEN, chat_id, f"Mailbox error: {e}")
+                    continue
+                if not sent:
                     llm.send(TOKEN, chat_id, "No new mail to summarize.")
                 continue
             try:

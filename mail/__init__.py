@@ -24,43 +24,58 @@ _summary_lock = threading.Lock()
 _last_flush_date = None
 
 
-def analyze(model, sender, subject, body):
+def classify(model, sender, subject, body):
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
     prompt = (
         f"Current date and time: {now}\n"
-        "Triage this email for Bryan. Decide if it is urgent, then summarize it.\n"
+        "Is this email urgent for Bryan?\n"
         "URGENT = needs immediate attention: a deadline within a day or two, security or account "
         "alerts, payment or billing problems, a time-sensitive request from a real person, or "
         "anything that loses money or an opportunity if missed.\n"
         "NON-URGENT = newsletters, promotions, receipts, FYI, social notifications, routine updates.\n\n"
-        "Reply with JSON only: "
-        '{"urgent": true or false, "summary": "3-5 short sentences covering what it is about, who it '
-        'is from, and any deadline, date or amount of money mentioned."}\n\n'
+        'Reply with JSON only: {"urgent": true or false}\n\n'
         f"From: {sender}\nSubject: {subject}\n\n{body}"
     )
     raw = llm.chat(model, prompt, fmt="json")
     try:
-        data = json.loads(raw)
-        return bool(data.get("urgent")), str(data.get("summary", "")).strip()
+        return bool(json.loads(raw).get("urgent"))
     except (ValueError, AttributeError):
-        return False, raw.strip()
+        return False
 
 
-def notify(env, sender, subject, summary, urgent=False):
-    prefix = "URGENT - " if urgent else "Email: "
-    text = f"{prefix}{subject}\nFrom: {sender}\n\n{summary}"
-    llm.send(env["TELEGRAM_TOKEN"], env["TELEGRAM_CHAT_ID"], text)
+def summarize(model, sender, subject, body):
+    prompt = (
+        "Summarize this email in 3-5 short sentences. Include what it is about, who it is from, "
+        "and any deadline, date, or amount of money mentioned.\n\n"
+        f"From: {sender}\nSubject: {subject}\n\n{body}"
+    )
+    return llm.chat(model, prompt)
 
 
-def append_summary(sender, subject, summary):
+def notify(env, sender, subject, summary):
+    llm.send(env["TELEGRAM_TOKEN"], env["TELEGRAM_CHAT_ID"],
+             f"URGENT - {subject}\nFrom: {sender}\n\n{summary}")
+
+
+def append_summary(sender, subject, body):
     stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-    entry = f"## {stamp} | {sender} | {subject}\n{summary}\n\n"
+    snippet = " ".join(body.split())[:400]
+    entry = f"## {stamp} | {sender} | {subject}\n{snippet}\n\n"
     with _summary_lock:
         with open(SUMMARY_FILE, "a", encoding="utf-8") as f:
             f.write(entry)
 
 
-def flush_summary(env):
+def digest(model, text):
+    prompt = (
+        "Below are notes on emails that arrived recently. Write one short digest of what happened: "
+        "group similar mail together, name notable senders, and call out anything that needs "
+        "attention. Do not list every email individually.\n\n" + text[:12000]
+    )
+    return llm.chat(model, prompt)
+
+
+def flush_summary(env, model):
     global _last_flush_date
     with _summary_lock:
         if not os.path.exists(SUMMARY_FILE):
@@ -69,8 +84,8 @@ def flush_summary(env):
             text = f.read().strip()
         if not text:
             return False
-        # ponytail: one Telegram message, 4096-char cap; chunk or sendDocument if the day's summary exceeds it
-        llm.send(env["TELEGRAM_TOKEN"], env["TELEGRAM_CHAT_ID"], text)
+        # ponytail: one Telegram message, 4096-char cap; chunk or sendDocument if the digest exceeds it
+        llm.send(env["TELEGRAM_TOKEN"], env["TELEGRAM_CHAT_ID"], digest(model, text))
         os.remove(SUMMARY_FILE)
         _last_flush_date = datetime.date.today()
         return True
@@ -267,12 +282,13 @@ def poll_once_gmail(env, model):
         image_text = ocr_images(payload)
         if image_text:
             body += "\n\n[Image text]\n" + image_text
-        urgent, summary = analyze(model, sender, subject, body[:4000])
-        print(f"{'URGENT' if urgent else 'Mail'} from {sender}: {subject}")
-        if urgent:
-            notify(env, sender, subject, summary, urgent=True)
+        body = body[:4000]
+        if classify(model, sender, subject, body):
+            print(f"URGENT from {sender}: {subject}")
+            notify(env, sender, subject, summarize(model, sender, subject, body))
         else:
-            append_summary(sender, subject, summary)
+            print(f"Queued for digest: {subject}")
+            append_summary(sender, subject, body)
         seen.add(mid)
         seen = save_seen(seen)
 
@@ -329,7 +345,7 @@ def run_poller():
         today = datetime.date.today()
         if datetime.datetime.now().hour >= 8 and _last_flush_date != today:
             try:
-                flush_summary(env)
+                flush_summary(env, model)
             except Exception as e:
                 print(f"Summary flush error: {e}")
             _last_flush_date = today
