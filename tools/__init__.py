@@ -4,29 +4,40 @@ import pkgutil
 REGISTRY = {}
 
 
-def tool(description, parameters):
+def tool(description, parameters, triggers=None):
     def deco(fn):
         REGISTRY[fn.__name__] = {
             "fn": fn,
             "description": description,
             "parameters": parameters,
+            "triggers": [t.lower() for t in (triggers or [])],
         }
         return fn
 
     return deco
 
 
+def _schema(name, entry):
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": entry["description"],
+            "parameters": entry["parameters"],
+        },
+    }
+
+
 def schemas():
+    return [_schema(name, entry) for name, entry in REGISTRY.items()]
+
+
+def schemas_for(text):
+    lowered = text.lower()
     return [
-        {
-            "type": "function",
-            "function": {
-                "name": name,
-                "description": entry["description"],
-                "parameters": entry["parameters"],
-            },
-        }
+        _schema(name, entry)
         for name, entry in REGISTRY.items()
+        if not entry["triggers"] or any(t in lowered for t in entry["triggers"])
     ]
 
 

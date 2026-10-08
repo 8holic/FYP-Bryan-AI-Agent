@@ -12,7 +12,7 @@ def run(model, text, system, max_steps=8):
     messages.append({"role": "user", "content": text})
 
     for _ in range(max_steps):
-        message = llm.chat_raw(model, messages, tools=tools.schemas() or None)
+        message = llm.chat_raw(model, messages, tools=tools.schemas_for(text) or None)
         messages.append(message)
         calls = message.get("tool_calls")
         if not calls:

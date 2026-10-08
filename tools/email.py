@@ -18,7 +18,7 @@ PARAMETERS = {
 }
 
 
-@tool(DESCRIPTION, PARAMETERS)
+@tool(DESCRIPTION, PARAMETERS, triggers=["email", "mail", "inbox"])
 def search_email(query, limit=5):
     rows = store.search(query, limit)
     if not rows:
