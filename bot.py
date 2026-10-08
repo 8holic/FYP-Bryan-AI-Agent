@@ -182,7 +182,7 @@ def main():
                 continue
 
             try:
-                reply = agent.run(model, text, system_prompt)
+                reply = agent.run(model, text, system_prompt, ctx=ctx)
                 print(f"> {reply}")
                 llm.send(TOKEN, chat_id, reply)
             except Exception as e:

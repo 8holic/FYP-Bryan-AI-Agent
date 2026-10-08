@@ -2,6 +2,7 @@ import json
 import os
 import urllib.error
 import urllib.request
+import uuid
 
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "")
@@ -115,3 +116,37 @@ def download_file(token, file_path):
     req = urllib.request.Request(url)
     with urllib.request.urlopen(req, timeout=600) as resp:
         return resp.read()
+
+
+def _multipart(fields, files):
+    boundary = "----opencode" + uuid.uuid4().hex
+    chunks = []
+    for key, value in fields.items():
+        chunks.append(
+            f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"\r\n\r\n{value}\r\n'.encode())
+    for key, (filename, content) in files.items():
+        chunks.append(
+            f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"; '
+            f'filename="{filename}"\r\nContent-Type: application/octet-stream\r\n\r\n'.encode())
+        chunks.append(content)
+        chunks.append(b"\r\n")
+    chunks.append(f"--{boundary}--\r\n".encode())
+    return boundary, b"".join(chunks)
+
+
+def send_upload(token, method, chat_id, field, filename, data):
+    boundary, body = _multipart({"chat_id": str(chat_id)}, {field: (filename, data)})
+    req = urllib.request.Request(
+        f"{API}/bot{token}/{method}",
+        data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    with urllib.request.urlopen(req, timeout=600) as resp:
+        return json.loads(resp.read().decode())
+
+
+def send_photo(token, chat_id, filename, data):
+    return send_upload(token, "sendPhoto", chat_id, "photo", filename, data)
+
+
+def send_document(token, chat_id, filename, data):
+    return send_upload(token, "sendDocument", chat_id, "document", filename, data)

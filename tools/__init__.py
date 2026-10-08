@@ -1,4 +1,5 @@
 import importlib
+import inspect
 import pkgutil
 
 REGISTRY = {}
@@ -41,11 +42,14 @@ def schemas_for(text):
     ]
 
 
-def call(name, arguments):
+def call(name, arguments, ctx=None):
     entry = REGISTRY.get(name)
     if not entry:
         return f"Unknown tool: {name}"
-    return entry["fn"](**arguments)
+    fn = entry["fn"]
+    if ctx is not None and "ctx" in inspect.signature(fn).parameters:
+        arguments = {**arguments, "ctx": ctx}
+    return fn(**arguments)
 
 
 def load_all():

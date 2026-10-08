@@ -4,7 +4,7 @@ import llm
 import tools
 
 
-def run(model, text, system, max_steps=8):
+def run(model, text, system, ctx=None, max_steps=8):
     tools.load_all()
     messages = []
     if system:
@@ -26,7 +26,7 @@ def run(model, text, system, max_steps=8):
                 except ValueError:
                     args = {}
             try:
-                result = tools.call(name, args)
+                result = tools.call(name, args, ctx)
             except Exception as e:
                 result = f"Tool error: {e}"
             messages.append({"role": "tool", "content": str(result)})
