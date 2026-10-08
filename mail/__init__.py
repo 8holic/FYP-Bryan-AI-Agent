@@ -351,12 +351,15 @@ def run_poller():
         llm.load_env_file(ENV_FILE)
         missing = [k for k in needed if not env.get(k)]
         model = llm.OLLAMA_MODEL
-        if not missing and not model:
+        if not missing:
             try:
                 available = llm.models()
-                model = available[0] if available else ""
             except Exception:
-                model = ""
+                available = []
+            if model not in available and available:
+                if model:
+                    print(f"Model {model!r} is not installed; using {available[0]!r} instead")
+                model = available[0]
         if missing or not model:
             if not warned:
                 if missing:
