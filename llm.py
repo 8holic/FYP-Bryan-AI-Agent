@@ -107,6 +107,15 @@ def send(token, chat_id, text):
     return api(token, "sendMessage", {"chat_id": chat_id, "text": text})
 
 
+def send_chat_action(token, chat_id, action="typing"):
+    return api(token, "sendChatAction", {"chat_id": chat_id, "action": action})
+
+
+def edit_message(token, chat_id, message_id, text):
+    return api(token, "editMessageText",
+               {"chat_id": chat_id, "message_id": message_id, "text": text})
+
+
 def get_file_path(token, file_id):
     return api(token, "getFile", {"file_id": file_id})["result"]["file_path"]
 

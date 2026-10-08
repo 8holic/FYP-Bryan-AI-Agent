@@ -25,6 +25,11 @@ def run(model, text, system, ctx=None, max_steps=8):
                     args = json.loads(args)
                 except ValueError:
                     args = {}
+            if ctx is not None and hasattr(ctx, "edit"):
+                try:
+                    ctx.edit(f"running {name}...")
+                except Exception:
+                    pass
             try:
                 result = tools.call(name, args, ctx)
             except Exception as e:

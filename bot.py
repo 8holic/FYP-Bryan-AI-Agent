@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+import threading
 import time
 import urllib.error
 
@@ -16,15 +17,43 @@ TOKEN = ""
 
 
 class Ctx:
-    def __init__(self, token, chat_id, env, model, system_prompt):
+    def __init__(self, token, chat_id, env, model, system_prompt, status_id=None):
         self.token = token
         self.chat_id = chat_id
         self.env = env
         self.model = model
         self.system_prompt = system_prompt
+        self.status_id = status_id
 
     def send(self, text):
         llm.send(self.token, self.chat_id, text)
+
+    def edit(self, text):
+        if self.status_id:
+            llm.edit_message(self.token, self.chat_id, self.status_id, text)
+
+
+class Typing:
+    def __init__(self, token, chat_id, action="typing"):
+        self.token = token
+        self.chat_id = chat_id
+        self.action = action
+        self._stop = threading.Event()
+
+    def __enter__(self):
+        threading.Thread(target=self._run, daemon=True).start()
+        return self
+
+    def _run(self):
+        while not self._stop.is_set():
+            try:
+                llm.send_chat_action(self.token, self.chat_id, self.action)
+            except Exception:
+                pass
+            self._stop.wait(4)
+
+    def __exit__(self, *exc):
+        self._stop.set()
 
 
 def sanitize(name):
@@ -181,13 +210,29 @@ def main():
                     llm.send(TOKEN, chat_id, reply)
                 continue
 
+            status = llm.send(TOKEN, chat_id, "thinking...")
+            ctx.status_id = (status.get("result") or {}).get("message_id")
             try:
-                reply = agent.run(model, text, system_prompt, ctx=ctx)
+                with Typing(TOKEN, chat_id, "typing"):
+                    reply = agent.run(model, text, system_prompt, ctx=ctx)
+                reply = reply or "(no response)"
                 print(f"> {reply}")
-                llm.send(TOKEN, chat_id, reply)
+                if ctx.status_id:
+                    try:
+                        llm.edit_message(TOKEN, chat_id, ctx.status_id, reply)
+                    except Exception:
+                        llm.send(TOKEN, chat_id, reply)
+                else:
+                    llm.send(TOKEN, chat_id, reply)
             except Exception as e:
                 print(f"Error: {e}")
-                llm.send(TOKEN, chat_id, f"Error: {e}")
+                if ctx.status_id:
+                    try:
+                        llm.edit_message(TOKEN, chat_id, ctx.status_id, f"Error: {e}")
+                    except Exception:
+                        llm.send(TOKEN, chat_id, f"Error: {e}")
+                else:
+                    llm.send(TOKEN, chat_id, f"Error: {e}")
 
 
 if __name__ == "__main__":
