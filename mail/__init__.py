@@ -46,8 +46,9 @@ def classify(model, sender, subject, body):
 
 def summarize(model, sender, subject, body):
     prompt = (
-        "Summarize this email in 3-5 short sentences. Include what it is about, who it is from, "
-        "and any deadline, date, or amount of money mentioned.\n\n"
+        "Summarize this email in 3-5 short sentences. Include what it is about and who it is from. "
+        "Mention a deadline, date, or amount of money only if the email actually states one. "
+        "Never say that no deadline, date, or amount was mentioned.\n\n"
         f"From: {sender}\nSubject: {subject}\n\n{body}"
     )
     return llm.chat(model, prompt)
@@ -79,9 +80,11 @@ def append_summary(sender, subject, body):
 
 def digest(model, text):
     prompt = (
-        "Below are notes on emails that arrived recently. Write one short digest of what happened: "
-        "group similar mail together, name notable senders, and call out anything that needs "
-        "attention. Do not list every email individually.\n\n" + text[:12000]
+        "Below are notes on recently received emails. Write a short digest that groups related "
+        "emails by topic. If several emails are about the same thing, combine them into one line "
+        "and say how many there were (for example: '4 emails about an economic study'). Do not "
+        "list every email individually. Note anything time-sensitive and whether it has already "
+        "passed. Keep it to a few lines.\n\n" + text[:12000]
     )
     return llm.chat(model, prompt)
 

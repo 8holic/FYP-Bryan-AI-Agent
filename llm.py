@@ -104,3 +104,14 @@ def api(token, method, data=None):
 
 def send(token, chat_id, text):
     return api(token, "sendMessage", {"chat_id": chat_id, "text": text})
+
+
+def get_file_path(token, file_id):
+    return api(token, "getFile", {"file_id": file_id})["result"]["file_path"]
+
+
+def download_file(token, file_path):
+    url = f"{API}/file/bot{token}/{file_path}"
+    req = urllib.request.Request(url)
+    with urllib.request.urlopen(req, timeout=600) as resp:
+        return resp.read()

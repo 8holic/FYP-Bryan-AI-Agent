@@ -7,6 +7,7 @@ import urllib.error
 import agent
 import instructions
 import llm
+import nextcloud
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ENV_FILE = os.path.join(HERE, ".env")
@@ -24,6 +25,26 @@ class Ctx:
 
     def send(self, text):
         llm.send(self.token, self.chat_id, text)
+
+
+def sanitize(name):
+    cleaned = "".join(c if c.isalnum() or c in "-_. " else "_" for c in name)
+    return cleaned.strip() or "file"
+
+
+def save_to_nextcloud(document, photo):
+    if document:
+        file_id = document["file_id"]
+        original = document.get("file_name") or "document"
+    else:
+        file_id = photo[-1]["file_id"]
+        original = "photo.jpg"
+    data = llm.download_file(TOKEN, llm.get_file_path(TOKEN, file_id))
+    folder = llm.env_items(ENV_FILE).get("NEXTCLOUD_UPLOAD_DIR") or "Telegram"
+    name = f"{time.strftime('%Y-%m-%d_%H%M%S')}_{sanitize(original)}"
+    target = f"{folder}/{name}"
+    nextcloud.upload(target, data)
+    return target
 
 
 def ensure_env():
@@ -122,9 +143,22 @@ def main():
         for update in poll_updates(offset):
             offset = update["update_id"] + 1
             message = update.get("message")
-            if not message or "text" not in message:
+            if not message:
                 continue
             chat_id = message["chat"]["id"]
+            document = message.get("document")
+            photo = message.get("photo")
+            if document or photo:
+                try:
+                    where = save_to_nextcloud(document, photo)
+                    print(f"< uploaded {where}")
+                    llm.send(TOKEN, chat_id, f"Saved to Nextcloud: {where}")
+                except Exception as e:
+                    print(f"Upload error: {e}")
+                    llm.send(TOKEN, chat_id, f"Upload error: {e}")
+                continue
+            if "text" not in message:
+                continue
             text = message["text"].strip()
             print(f"< {message['chat'].get('username', chat_id)}: {text}")
 
