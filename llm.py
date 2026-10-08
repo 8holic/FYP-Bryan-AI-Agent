@@ -5,6 +5,7 @@ import urllib.request
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "")
 OLLAMA_CONTEXT_LENGTH = 0
+OLLAMA_VISION_MODEL = os.environ.get("OLLAMA_VISION_MODEL", "")
 DEFAULT_SYSTEM_PROMPT = (
     "You are Bryan's personal assistant bot running on Telegram, connected to his email. "
     "Your job is to triage his incoming mail: urgent messages are sent to him immediately, "
@@ -35,12 +36,14 @@ def write_env(path, items):
 
 
 def load_env_file(path):
-    global OLLAMA_HOST, OLLAMA_MODEL, OLLAMA_CONTEXT_LENGTH
+    global OLLAMA_HOST, OLLAMA_MODEL, OLLAMA_CONTEXT_LENGTH, OLLAMA_VISION_MODEL
     for key, value in env_items(path).items():
         if key == "OLLAMA_HOST":
             OLLAMA_HOST = value
         elif key == "OLLAMA_MODEL":
             OLLAMA_MODEL = value
+        elif key == "OLLAMA_VISION_MODEL":
+            OLLAMA_VISION_MODEL = value
         elif key == "OLLAMA_CONTEXT_LENGTH":
             OLLAMA_CONTEXT_LENGTH = int(value) if value.isdigit() else 0
 
@@ -49,7 +52,8 @@ def _request(path, data=None):
     headers = {"Content-Type": "application/json"}
     body = json.dumps(data).encode() if data is not None else None
     req = urllib.request.Request(OLLAMA_HOST + path, data=body, headers=headers)
-    with urllib.request.urlopen(req, timeout=600) as resp:
+    timeout = None if os.environ.get("OLLAMA_NO_TIMEOUT") else 600
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode())
 
 
@@ -58,19 +62,27 @@ def models():
     return [m["name"] for m in tags.get("models", [])]
 
 
-def chat(model, message, system=None, fmt=None):
-    payload = {"model": model, "stream": False}
+def chat_raw(model, messages, tools=None, fmt=None):
+    payload = {"model": model, "messages": messages, "stream": False}
     if OLLAMA_CONTEXT_LENGTH:
         payload["options"] = {"num_ctx": OLLAMA_CONTEXT_LENGTH}
+    if tools:
+        payload["tools"] = tools
     if fmt:
         payload["format"] = fmt
+    out = _request("/api/chat", payload)
+    return out["message"]
+
+
+def chat(model, message, system=None, fmt=None, images=None):
     messages = []
     if system:
         messages.append({"role": "system", "content": system})
-    messages.append({"role": "user", "content": message})
-    payload["messages"] = messages
-    out = _request("/api/chat", payload)
-    return out["message"]["content"]
+    user = {"role": "user", "content": message}
+    if images:
+        user["images"] = images
+    messages.append(user)
+    return chat_raw(model, messages, fmt=fmt).get("content", "")
 
 
 API = "https://api.telegram.org"

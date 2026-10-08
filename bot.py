@@ -4,13 +4,26 @@ import sys
 import time
 import urllib.error
 
+import agent
+import instructions
 import llm
-import mail
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ENV_FILE = os.path.join(HERE, ".env")
 POLL_TIMEOUT = 30
 TOKEN = ""
+
+
+class Ctx:
+    def __init__(self, token, chat_id, env, model, system_prompt):
+        self.token = token
+        self.chat_id = chat_id
+        self.env = env
+        self.model = model
+        self.system_prompt = system_prompt
+
+    def send(self, text):
+        llm.send(self.token, self.chat_id, text)
 
 
 def ensure_env():
@@ -83,6 +96,7 @@ def main():
     env = ensure_env()
     TOKEN = env["TELEGRAM_TOKEN"]
     llm.load_env_file(ENV_FILE)
+    instructions.load_all()
     system_prompt = llm.DEFAULT_SYSTEM_PROMPT
 
     model = llm.OLLAMA_MODEL
@@ -121,31 +135,20 @@ def main():
                 llm.write_env(ENV_FILE, env)
                 print(f"Saved chat id {chat_id} to {ENV_FILE}")
 
-            if text == "/start":
-                llm.send(TOKEN, chat_id, f"Connected to local model: {model}. Send a message.")
-                continue
-            if text == "/chatid":
-                llm.send(TOKEN, chat_id, str(chat_id))
-                continue
-            if text.startswith("/model"):
-                name = text.split(None, 1)[1].strip()
-                if name in available:
-                    model = name
-                    llm.send(TOKEN, chat_id, f"Switched to {model}")
-                else:
-                    llm.send(TOKEN, chat_id, f"Not installed: {name}. Available: {', '.join(available) or 'none'}")
-                continue
-            if "mailbox" in text.lower():
+            ctx = Ctx(TOKEN, chat_id, llm.env_items(ENV_FILE), model, system_prompt)
+
+            if text.startswith("/"):
                 try:
-                    sent = mail.flush_summary(llm.env_items(ENV_FILE), model)
+                    reply = instructions.dispatch(ctx, text)
                 except Exception as e:
-                    llm.send(TOKEN, chat_id, f"Mailbox error: {e}")
-                    continue
-                if not sent:
-                    llm.send(TOKEN, chat_id, "No new mail to summarize.")
+                    reply = f"Command error: {e}"
+                if reply:
+                    print(f"> {reply}")
+                    llm.send(TOKEN, chat_id, reply)
                 continue
+
             try:
-                reply = llm.chat(model, text, system=system_prompt)
+                reply = agent.run(model, text, system_prompt)
                 print(f"> {reply}")
                 llm.send(TOKEN, chat_id, reply)
             except Exception as e:

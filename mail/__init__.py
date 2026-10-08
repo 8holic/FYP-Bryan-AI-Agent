@@ -13,6 +13,7 @@ import urllib.request
 import webbrowser
 
 import llm
+from . import store
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ENV_FILE = os.path.join(HERE, ".env")
@@ -50,6 +51,16 @@ def summarize(model, sender, subject, body):
         f"From: {sender}\nSubject: {subject}\n\n{body}"
     )
     return llm.chat(model, prompt)
+
+
+def vision_read(model, sender, subject, images):
+    prompt = (
+        "Read the images from this email. Transcribe all visible text exactly, and describe "
+        "the important content: names, dates, deadlines, amounts, invoice or receipt details, "
+        "or what a screenshot shows. Be factual and concise.\n\n"
+        f"From: {sender}\nSubject: {subject}"
+    )
+    return llm.chat(model, prompt, images=images)
 
 
 def notify(env, sender, subject, summary):
@@ -277,13 +288,16 @@ def poll_once_gmail(env, model):
                    for h in payload.get("headers", [])}
         sender = headers.get("from", "")
         subject = headers.get("subject", "")
+        date = headers.get("date", "")
         print(f"Reading email from {sender}: {subject}")
         body = mime_text(payload)
         image_text = ocr_images(payload)
         if image_text:
             body += "\n\n[Image text]\n" + image_text
         body = body[:4000]
-        if classify(model, sender, subject, body):
+        urgent = classify(model, sender, subject, body)
+        store.upsert(mid, sender, subject, date, body, urgent)
+        if urgent:
             print(f"URGENT from {sender}: {subject}")
             notify(env, sender, subject, summarize(model, sender, subject, body))
         else:

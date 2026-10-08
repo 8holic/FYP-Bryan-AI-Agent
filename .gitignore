@@ -1,6 +1,7 @@
 .env
 .gmail_seen.json
 .mailbox_summary.md
+mail.db
 .venv/
 __pycache__/
 *.pyc
