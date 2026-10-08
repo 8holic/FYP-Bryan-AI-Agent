@@ -282,7 +282,15 @@ def poll_once_gmail(env, model):
         mid = msg["id"]
         if mid in seen:
             continue
-        full = gmail_get(env, f"/messages/{mid}?format=full")
+        try:
+            full = gmail_get(env, f"/messages/{mid}?format=full")
+        except urllib.error.HTTPError as e:
+            print(f"Fetch failed for {mid}: {e}")
+            if e.code == 404:
+                seen.add(mid)
+                seen = save_seen(seen)
+                continue
+            raise
         payload = full.get("payload", {})
         headers = {h.get("name", "").lower(): h.get("value", "")
                    for h in payload.get("headers", [])}
@@ -295,7 +303,11 @@ def poll_once_gmail(env, model):
         if image_text:
             body += "\n\n[Image text]\n" + image_text
         body = body[:4000]
-        urgent = classify(model, sender, subject, body)
+        try:
+            urgent = classify(model, sender, subject, body)
+        except Exception as e:
+            print(f"Classify failed for {mid} ({sender}): {e}")
+            raise
         store.upsert(mid, sender, subject, date, body, urgent)
         if urgent:
             print(f"URGENT from {sender}: {subject}")
