@@ -1,5 +1,6 @@
 import json
 import os
+import urllib.error
 import urllib.request
 
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
@@ -53,8 +54,12 @@ def _request(path, data=None):
     body = json.dumps(data).encode() if data is not None else None
     req = urllib.request.Request(OLLAMA_HOST + path, data=body, headers=headers)
     timeout = None if os.environ.get("OLLAMA_NO_TIMEOUT") else 600
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode())
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")
+        raise RuntimeError(f"HTTP {e.code} from {OLLAMA_HOST + path}: {detail}") from e
 
 
 def models():
