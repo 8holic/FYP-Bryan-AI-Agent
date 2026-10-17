@@ -1,16 +1,15 @@
 import base64
 import datetime
+import email
+import getpass
 import html
-import http.server
+import imaplib
 import json
 import os
 import re
 import threading
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
-import webbrowser
+from email import policy
 
 import llm
 from . import store
@@ -20,7 +19,6 @@ ENV_FILE = os.path.join(HERE, ".env")
 SEEN_FILE = os.path.join(HERE, ".gmail_seen.json")
 SUMMARY_FILE = os.path.join(HERE, ".mailbox_summary.md")
 
-_tok = {"access": None, "exp": 0}
 _summary_lock = threading.Lock()
 _last_flush_date = None
 
@@ -105,103 +103,37 @@ def flush_summary(env, model):
         return True
 
 
-def _oauth_token(params):
-    data = urllib.parse.urlencode(params).encode()
-    req = urllib.request.Request(
-        "https://oauth2.googleapis.com/token", data=data,
-        headers={"Content-Type": "application/x-www-form-urlencoded"})
+IMAP_HOST = "imap.gmail.com"
+IMAP_PORT = 993
+IMAP_QUERY = "is:unread -category:promotions newer_than:1d"
+
+
+class LoginError(RuntimeError):
+    pass
+
+
+def _imap_connect(env):
+    address = env.get("GMAIL_ADDRESS", "").strip()
+    password = env.get("GMAIL_APP_PASSWORD", "").replace(" ", "").strip()
+    detail = (f"GMAIL_ADDRESS={len(address)} chars (has '@': {'@' in address}), "
+              f"GMAIL_APP_PASSWORD={len(password)} chars after removing spaces")
+    conn = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT, timeout=120)
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            return json.loads(resp.read().decode())
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"Token exchange failed ({e.code}): {e.read().decode()}")
-
-
-def consent(env):
-    client_id = env["GMAIL_CLIENT_ID"]
-    client_secret = env["GMAIL_CLIENT_SECRET"]
-    holder = {}
-
-    class Handler(http.server.BaseHTTPRequestHandler):
-        def do_GET(self):
-            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-            if "code" in query:
-                holder["code"] = query["code"][0]
-                body = b"Authorized. You can close this window."
-            elif "error" in query:
-                holder["error"] = query["error"][0]
-                body = b"Authorization failed. Close and try again."
-            else:
-                body = b"No code received."
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html")
-            self.end_headers()
-            self.wfile.write(body)
-
-        def log_message(self, *args):
-            pass
-
-    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
-    port = server.server_address[1]
-    redirect = f"http://127.0.0.1:{port}/"
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    params = urllib.parse.urlencode({
-        "client_id": client_id,
-        "redirect_uri": redirect,
-        "response_type": "code",
-        "scope": "https://www.googleapis.com/auth/gmail.readonly",
-        "access_type": "offline",
-        "prompt": "select_account consent",
-    })
-    url = f"https://accounts.google.com/o/oauth2/v2/auth?{params}"
-    print("Opening browser for Google authorization...")
-    webbrowser.open(url)
-    while "code" not in holder and "error" not in holder:
-        time.sleep(0.5)
-    server.shutdown()
-    if "error" in holder:
-        raise RuntimeError(f"Google authorization failed: {holder['error']}")
-    result = _oauth_token({
-        "code": holder["code"],
-        "client_id": client_id,
-        "client_secret": client_secret,
-        "redirect_uri": redirect,
-        "grant_type": "authorization_code",
-    })
-    return result["refresh_token"]
-
-
-def access_token(env, force=False):
-    if not force and _tok["access"] and time.time() < _tok["exp"]:
-        return _tok["access"]
-    result = _oauth_token({
-        "grant_type": "refresh_token",
-        "client_id": env["GMAIL_CLIENT_ID"],
-        "client_secret": env["GMAIL_CLIENT_SECRET"],
-        "refresh_token": env["GMAIL_REFRESH_TOKEN"],
-    })
-    _tok["access"] = result["access_token"]
-    _tok["exp"] = time.time() + int(result.get("expires_in", 3600)) - 60
-    return _tok["access"]
-
-
-def gmail_get(env, path):
-    try:
-        access = access_token(env)
-        return _gmail_get(access, path)
-    except urllib.error.HTTPError as e:
-        if e.code != 401:
+        try:
+            conn.login(address, password)
+        except imaplib.IMAP4.abort:
             raise
-    access = access_token(env, force=True)
-    return _gmail_get(access, path)
-
-
-def _gmail_get(access, path):
-    req = urllib.request.Request(
-        f"https://gmail.googleapis.com/gmail/v1/users/me{path}",
-        headers={"Authorization": f"Bearer {access}"})
-    with urllib.request.urlopen(req, timeout=600) as resp:
-        return json.loads(resp.read().decode())
+        except imaplib.IMAP4.error as e:
+            raise LoginError(
+                f"Gmail rejected the login: {e}. {detail}. "
+                "Google app passwords are 16 characters and require 2-Step Verification.") from e
+    except Exception:
+        try:
+            conn.shutdown()
+        except Exception:
+            pass
+        raise
+    return conn
 
 
 def load_seen():
@@ -219,43 +151,42 @@ def save_seen(seen):
     return seen
 
 
-def mime_text(payload):
-    if not payload:
-        return ""
-    if payload.get("body", {}).get("data"):
+def message_text(msg):
+    plain, rich = [], []
+    for part in msg.walk():
+        if part.get_content_maintype() == "multipart" or part.get_filename():
+            continue
+        payload = part.get_payload(decode=True)
+        if not payload:
+            continue
         try:
-            data = base64.urlsafe_b64decode(payload["body"]["data"]).decode("utf-8", "replace")
-        except Exception:
-            data = ""
-        mime = payload.get("mimeType", "")
-        if mime == "text/plain":
-            return data
-        if mime == "text/html":
-            return html.unescape(re.sub(r"<[^>]+>", " ", data))
-    for part in payload.get("parts", []) or []:
-        text = mime_text(part)
-        if text:
-            return text
-    return ""
+            text = payload.decode(part.get_content_charset() or "utf-8", "replace")
+        except LookupError:
+            text = payload.decode("utf-8", "replace")
+        ctype = part.get_content_type()
+        if ctype == "text/plain":
+            plain.append(text)
+        elif ctype == "text/html":
+            rich.append(html.unescape(re.sub(r"<[^>]+>", " ", text)))
+    return "\n".join(plain or rich)
 
 
-def image_parts(payload):
-    if not payload:
-        return []
+def image_parts(msg):
     out = []
-    if payload.get("mimeType", "").startswith("image/") and payload.get("body", {}).get("data"):
-        out.append(payload["body"]["data"])
-    for part in payload.get("parts", []) or []:
-        out.extend(image_parts(part))
+    for part in msg.walk():
+        if part.get_content_maintype() == "image":
+            data = part.get_payload(decode=True)
+            if data:
+                out.append(base64.b64encode(data).decode())
     return out
 
 
 _ocr = None
 
 
-def ocr_images(payload):
+def ocr_images(msg):
     global _ocr
-    data_list = image_parts(payload)
+    data_list = image_parts(msg)
     if not data_list:
         return ""
     try:
@@ -268,7 +199,7 @@ def ocr_images(payload):
     lines = []
     for data in data_list:
         try:
-            result, _ = _ocr(base64.urlsafe_b64decode(data))
+            result, _ = _ocr(base64.b64decode(data))
         except Exception as e:
             print(f"OCR error: {e}")
             continue
@@ -279,60 +210,72 @@ def ocr_images(payload):
 
 def poll_once_gmail(env, model):
     seen = load_seen()
-    start = (datetime.date.today() - datetime.timedelta(days=1)).strftime("%Y/%m/%d")
-    data = gmail_get(env, f"/messages?q=is:unread%20-category:promotions%20after:{start}&maxResults=500")
-    for msg in data.get("messages", []):
-        mid = msg["id"]
-        if mid in seen:
-            continue
-        try:
-            full = gmail_get(env, f"/messages/{mid}?format=full")
-        except urllib.error.HTTPError as e:
-            print(f"Fetch failed for {mid}: {e}")
-            if e.code == 404:
-                seen.add(mid)
-                seen = save_seen(seen)
+    conn = _imap_connect(env)
+    try:
+        conn.select("INBOX", readonly=True)
+        _, data = conn.response("UIDVALIDITY")
+        validity = data[0].decode() if data and data[0] else "0"
+        typ, data = conn.uid("SEARCH", None, "X-GM-RAW", f'"{IMAP_QUERY}"')
+        if typ != "OK":
+            raise RuntimeError(f"IMAP search failed: {data}")
+        for uid in (data[0].split() if data and data[0] else []):
+            mid = f"uid:{validity}:{uid.decode()}"
+            if mid in seen:
                 continue
-            raise
-        payload = full.get("payload", {})
-        headers = {h.get("name", "").lower(): h.get("value", "")
-                   for h in payload.get("headers", [])}
-        sender = headers.get("from", "")
-        subject = headers.get("subject", "")
-        date = headers.get("date", "")
-        print(f"Reading email from {sender}: {subject}")
-        body = mime_text(payload)
-        image_text = ocr_images(payload)
-        if image_text:
-            body += "\n\n[Image text]\n" + image_text
-        body = body[:4000]
+            typ, fetched = conn.uid("FETCH", uid, "(BODY.PEEK[])")
+            if typ != "OK" or not fetched or not isinstance(fetched[0], tuple):
+                print(f"Fetch failed for {mid}")
+                continue
+            msg = email.message_from_bytes(fetched[0][1], policy=policy.default)
+            sender = str(msg.get("From", ""))
+            subject = str(msg.get("Subject", ""))
+            date = str(msg.get("Date", ""))
+            print(f"Reading email from {sender}: {subject}")
+            body = message_text(msg)[:4000]
+            image_text = ocr_images(msg)
+            if image_text:
+                body += "\n\n[Image text]\n" + image_text
+            try:
+                urgent = classify(model, sender, subject, body)
+            except Exception as e:
+                print(f"Classify failed for {mid} ({sender}): {e}")
+                raise
+            store.upsert(mid, sender, subject, date, body, urgent)
+            if urgent:
+                print(f"URGENT from {sender}: {subject}")
+                notify(env, sender, subject, summarize(model, sender, subject, body))
+            else:
+                print(f"Queued for digest: {subject}")
+                append_summary(sender, subject, body)
+            seen.add(mid)
+            seen = save_seen(seen)
+    finally:
         try:
-            urgent = classify(model, sender, subject, body)
-        except Exception as e:
-            print(f"Classify failed for {mid} ({sender}): {e}")
-            raise
-        store.upsert(mid, sender, subject, date, body, urgent)
-        if urgent:
-            print(f"URGENT from {sender}: {subject}")
-            notify(env, sender, subject, summarize(model, sender, subject, body))
-        else:
-            print(f"Queued for digest: {subject}")
-            append_summary(sender, subject, body)
-        seen.add(mid)
-        seen = save_seen(seen)
+            conn.logout()
+        except Exception:
+            pass
 
 
 def ensure_email_env():
     env = llm.env_items(ENV_FILE)
-    if not env.get("GMAIL_CLIENT_ID"):
-        print("Add GMAIL_CLIENT_ID and GMAIL_CLIENT_SECRET to .env, then run again.")
-        return
-    if not env.get("GMAIL_CLIENT_SECRET"):
-        print("Add GMAIL_CLIENT_SECRET=<your client secret> to .env, then run again.")
-        return
-    if not env.get("GMAIL_REFRESH_TOKEN"):
-        print("Need to authorize the Gmail account once.")
-        env["GMAIL_REFRESH_TOKEN"] = consent(env)
+    changed = False
+    for key, prompt in (
+        ("GMAIL_ADDRESS", "Gmail address: "),
+        ("GMAIL_APP_PASSWORD", "Gmail app password (16 characters, no spaces): "),
+    ):
+        if env.get(key):
+            continue
+        try:
+            value = getpass.getpass(prompt) if key.endswith("PASSWORD") else input(prompt)
+        except EOFError:
+            value = ""
+        value = value.strip()
+        if not value:
+            print(f"Add {key}=... to .env, then run again.")
+            return
+        env[key] = value
+        changed = True
+    if changed:
         llm.write_env(ENV_FILE, env)
         print(f"Saved to {ENV_FILE}")
 
@@ -340,6 +283,8 @@ def ensure_email_env():
 def poll_gmail_once(env, model):
     try:
         poll_once_gmail(env, model)
+    except LoginError:
+        raise
     except Exception as e:
         print(f"Poll error: {e}")
 
@@ -347,7 +292,7 @@ def poll_gmail_once(env, model):
 def run_poller():
     global _last_flush_date
     warned = False
-    needed = ("GMAIL_CLIENT_SECRET", "GMAIL_REFRESH_TOKEN",
+    needed = ("GMAIL_ADDRESS", "GMAIL_APP_PASSWORD",
               "TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID")
     while True:
         env = llm.env_items(ENV_FILE)
@@ -373,7 +318,12 @@ def run_poller():
             time.sleep(10)
             continue
         warned = False
-        poll_gmail_once(env, model)
+        try:
+            poll_gmail_once(env, model)
+        except LoginError as e:
+            print(f"Login failed: {e}", flush=True)
+            print("Stopping.", flush=True)
+            os._exit(1)
         today = datetime.date.today()
         if datetime.datetime.now().hour >= 8 and _last_flush_date != today:
             try:
