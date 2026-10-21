@@ -1,13 +1,14 @@
 # FYP Bryan AI Agent
 
-A local AI assistant that watches a Gmail inbox and reports to Telegram, powered by a local Ollama model. No cloud LLM — everything runs on your own machine.
+A local AI assistant that watches an IMAP inbox (Gmail by default) and reports to Telegram, powered by a local Ollama model. No cloud LLM — everything runs on your own machine.
 
 ## What it does
 
-- Polls Gmail for new unread mail (last 24h, promotions excluded).
-- Classifies each email with the local model: **urgent** mail is summarized and pushed to Telegram immediately; **non-urgent** mail is queued as a compact note (sender, subject, snippet).
+- Polls any IMAP inbox for **all unread** mail, newest first, and excludes already-processed mail by marking it read on the server.
+- Classifies each email with the local model: **urgent** mail is summarized and pushed to Telegram immediately; **non-urgent** mail is queued as a compact note (sender, subject, snippet). Past deadlines are not urgent.
 - Flushes the queue on demand (Telegram `/mailbox`) or automatically at **08:00** local time: **one** model call turns the whole batch into a single digest, then the queue is cleared.
 - OCRs inline images in emails (RapidOCR) and feeds the extracted text to the model, so image-only mail still gets summarized.
+- Marks processed mail as read and tags it `AI Read` (Gmail label; `AIRead` keyword elsewhere).
 - Doubles as a Telegram chat bot backed by the same local model.
 
 ## Requirements
@@ -49,7 +50,7 @@ python3 -m venv .venv
 ### External services
 
 - **Telegram** bot token from [@BotFather](https://t.me/BotFather).
-- **Gmail** address plus an **App Password** (Google Account → Security → 2-Step Verification → App passwords). IMAP is always on for personal Gmail, so no OAuth client or consent flow is needed.
+- **IMAP** account. Gmail needs an **App Password** (Google Account → Security → 2-Step Verification → App passwords); other providers need IMAP enabled and an app password where required. OAuth-only providers are not supported.
 
 ## Configuration
 
@@ -61,21 +62,25 @@ TELEGRAM_CHAT_ID=
 OLLAMA_HOST=http://localhost:11434
 OLLAMA_MODEL=qwen3:8b
 OLLAMA_CONTEXT_LENGTH=16384
-GMAIL_ADDRESS=
-GMAIL_APP_PASSWORD=
+IMAP_HOST=imap.gmail.com
+IMAP_PORT=993
+IMAP_ADDRESS=
+IMAP_PASSWORD=
 ```
 
 | Key | Notes |
 |---|---|
 | `TELEGRAM_TOKEN` | from @BotFather |
-| `TELEGRAM_CHAT_ID` | auto-saved on first message if left blank |
+| `TELEGRAM_CHAT_ID` | the only chat id the bot accepts; also receives notifications |
 | `OLLAMA_HOST` | `http://localhost:11434`, or a LAN IP if Ollama runs elsewhere |
 | `OLLAMA_MODEL` | blank auto-picks the first installed model |
 | `OLLAMA_CONTEXT_LENGTH` | optional; omit to use the model default |
-| `GMAIL_ADDRESS` | the Gmail account to read |
-| `GMAIL_APP_PASSWORD` | 16-character app password, no spaces; requires 2-Step Verification |
+| `IMAP_HOST` | IMAP server; defaults to `imap.gmail.com` |
+| `IMAP_PORT` | IMAP SSL port; defaults to `993` |
+| `IMAP_ADDRESS` | address to log in with |
+| `IMAP_PASSWORD` | password or app password, no spaces |
 
-An app password is revoked when the Google Account password changes; generate a new one and update `.env` after any password change.
+`GMAIL_ADDRESS` and `GMAIL_APP_PASSWORD` are still accepted as fallbacks. An app password is revoked when the Google Account password changes; generate a new one and update `.env` after any password change.
 
 ## Run
 
@@ -90,12 +95,12 @@ On Windows: `.\.venv\Scripts\python.exe main.py`.
 | Command | Action |
 |---|---|
 | `/start` | show the connected model |
-| `/chatid` | print your chat id |
-| `/model <name>` | switch model |
 | `/mailbox` | send a digest of the collected non-urgent mail now (any message containing "mailbox" works) |
 
 ## Notes
 
-- Runtime state files (`.gmail_seen.json`, `.mailbox_summary.md`) are gitignored and created automatically.
-- The 08:00 flush uses the server's local time, and the Gmail IMAP query asks for unread mail from the last 24 hours — set the clock with `timedatectl`.
+- Runtime state (`.mailbox_summary.md`, `mail.db`) is gitignored and created automatically.
+- The 08:00 flush uses the server's local time.
+- Polls every 5 minutes; set `EMAIL_POLL_SECONDS` to change it.
+- Processed mail is marked read, so it is not polled again. Use `IMAP_HOST`/`IMAP_PORT` to point at a non-Gmail server.
 - The summary is sent as a single Telegram message (4096-char cap); very busy days could exceed it.

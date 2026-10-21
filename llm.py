@@ -1,5 +1,7 @@
 import json
 import os
+import threading
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -8,12 +10,33 @@ OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "")
 OLLAMA_CONTEXT_LENGTH = 0
 OLLAMA_VISION_MODEL = os.environ.get("OLLAMA_VISION_MODEL", "")
+_llm_lock = threading.Lock()
+_user_active = threading.Event()
+
+
+def begin_user():
+    _user_active.set()
+
+
+def end_user():
+    _user_active.clear()
+
+
+def wait_for_user_idle():
+    while _user_active.is_set():
+        time.sleep(0.2)
+
+
 DEFAULT_SYSTEM_PROMPT = (
     "You are Bryan's personal assistant bot running on Telegram, connected to his email. "
     "Your job is to triage his incoming mail: urgent messages are sent to him immediately, "
     "non-urgent ones are collected into a summary he can request by sending the word 'mailbox', "
     "or that is sent automatically every morning at 8am. "
     "When Bryan mentions 'my mailbox' or 'my mail', he means his email inbox. "
+    "You can use tools to search Bryan's stored email and to send files from Nextcloud. "
+    "You cannot reply to, compose, delete, or change email, and you cannot resolve reminders. "
+    "Only call a tool when the request clearly needs it. If a request needs a capability you "
+    "do not have, say so in one line instead of calling an unrelated tool. "
     "Answer only what he asked, in a few short sentences. No emojis, no filler, no inventing "
     "details. If you do not know something, say so in one line."
 )
@@ -54,7 +77,7 @@ def _request(path, data=None):
     headers = {"Content-Type": "application/json"}
     body = json.dumps(data).encode() if data is not None else None
     req = urllib.request.Request(OLLAMA_HOST + path, data=body, headers=headers)
-    timeout = None if os.environ.get("OLLAMA_NO_TIMEOUT") else 600
+    timeout = None if os.environ.get("OLLAMA_NO_TIMEOUT") else 1800
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode())
@@ -68,19 +91,22 @@ def models():
     return [m["name"] for m in tags.get("models", [])]
 
 
-def chat_raw(model, messages, tools=None, fmt=None):
+def chat_raw(model, messages, tools=None, fmt=None, think=None):
     payload = {"model": model, "messages": messages, "stream": False}
+    if think is not None:
+        payload["think"] = think
     if OLLAMA_CONTEXT_LENGTH:
         payload["options"] = {"num_ctx": OLLAMA_CONTEXT_LENGTH}
     if tools:
         payload["tools"] = tools
     if fmt:
         payload["format"] = fmt
-    out = _request("/api/chat", payload)
+    with _llm_lock:
+        out = _request("/api/chat", payload)
     return out["message"]
 
 
-def chat(model, message, system=None, fmt=None, images=None):
+def chat(model, message, system=None, fmt=None, images=None, think=None):
     messages = []
     if system:
         messages.append({"role": "system", "content": system})
@@ -88,7 +114,7 @@ def chat(model, message, system=None, fmt=None, images=None):
     if images:
         user["images"] = images
     messages.append(user)
-    return chat_raw(model, messages, fmt=fmt).get("content", "")
+    return chat_raw(model, messages, fmt=fmt, think=think).get("content", "")
 
 
 API = "https://api.telegram.org"

@@ -82,7 +82,7 @@ def ensure_env():
     required = ("TELEGRAM_TOKEN", "OLLAMA_HOST")
     for key, prompt, default in (
         ("TELEGRAM_TOKEN", "Telegram bot token (from @BotFather): ", ""),
-        ("TELEGRAM_CHAT_ID", "Your chat id (Enter to skip, auto-saved on first message): ", ""),
+        ("TELEGRAM_CHAT_ID", "Your chat id (required; only this chat is accepted): ", ""),
         ("OLLAMA_HOST", "Ollama host (Enter for localhost): ", "http://localhost:11434"),
         ("OLLAMA_MODEL", "Model name to use (Enter to auto-pick first installed): ", ""),
     ):
@@ -145,6 +145,9 @@ def main():
     global TOKEN
     env = ensure_env()
     TOKEN = env["TELEGRAM_TOKEN"]
+    allowed_chat_id = str(env.get("TELEGRAM_CHAT_ID") or "").strip()
+    if not allowed_chat_id:
+        print("TELEGRAM_CHAT_ID is not set; ignoring all messages.")
     llm.load_env_file(ENV_FILE)
     instructions.load_all()
     system_prompt = llm.DEFAULT_SYSTEM_PROMPT
@@ -164,7 +167,7 @@ def main():
         sys.exit(1)
 
     print(f"Bot running. Model: {model}")
-    print(f"Chat id set: {env.get('TELEGRAM_CHAT_ID') or '(not yet - will auto-save on first message)'}")
+    print(f"Allowed chat id: {allowed_chat_id or '(none - all messages ignored)'}")
     print("Ctrl+C to stop.")
 
     offset = 0
@@ -175,6 +178,9 @@ def main():
             if not message:
                 continue
             chat_id = message["chat"]["id"]
+            if str(chat_id) != allowed_chat_id:
+                print(f"< ignored message from chat {chat_id}")
+                continue
             document = message.get("document")
             photo = message.get("photo")
             if document or photo:
@@ -191,20 +197,17 @@ def main():
             text = message["text"].strip()
             print(f"< {message['chat'].get('username', chat_id)}: {text}")
 
-            current = llm.env_items(ENV_FILE).get("TELEGRAM_CHAT_ID", "")
-            if not current:
-                env = llm.env_items(ENV_FILE)
-                env["TELEGRAM_CHAT_ID"] = str(chat_id)
-                llm.write_env(ENV_FILE, env)
-                print(f"Saved chat id {chat_id} to {ENV_FILE}")
-
             ctx = Ctx(TOKEN, chat_id, llm.env_items(ENV_FILE), model, system_prompt)
 
             if text.startswith("/"):
+                llm.begin_user()
                 try:
-                    reply = instructions.dispatch(ctx, text)
-                except Exception as e:
-                    reply = f"Command error: {e}"
+                    try:
+                        reply = instructions.dispatch(ctx, text)
+                    except Exception as e:
+                        reply = f"Command error: {e}"
+                finally:
+                    llm.end_user()
                 if reply:
                     print(f"> {reply}")
                     llm.send(TOKEN, chat_id, reply)
@@ -212,6 +215,7 @@ def main():
 
             status = llm.send(TOKEN, chat_id, "thinking...")
             ctx.status_id = (status.get("result") or {}).get("message_id")
+            llm.begin_user()
             try:
                 with Typing(TOKEN, chat_id, "typing"):
                     reply = agent.run(model, text, system_prompt, ctx=ctx)
@@ -233,6 +237,8 @@ def main():
                         llm.send(TOKEN, chat_id, f"Error: {e}")
                 else:
                     llm.send(TOKEN, chat_id, f"Error: {e}")
+            finally:
+                llm.end_user()
 
 
 if __name__ == "__main__":

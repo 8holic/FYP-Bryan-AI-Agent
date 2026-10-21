@@ -59,7 +59,7 @@ def _fits(ctx, path, prompt):
         f"Request: {prompt}\n"
         "Does this image match the request? Reply with YES or NO followed by a very short reason."
     )
-    answer = llm.chat(ctx.model, question, images=image).strip()
+    answer = llm.chat(ctx.model, question, images=image, think=False).strip()
     return answer.lower().startswith("yes"), answer.replace("\n", " ")[:200]
 
 

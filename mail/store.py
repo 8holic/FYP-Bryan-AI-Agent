@@ -10,19 +10,36 @@ def _connect():
     conn.execute(
         "CREATE TABLE IF NOT EXISTS messages ("
         "id TEXT PRIMARY KEY, sender TEXT, subject TEXT, "
-        "date TEXT, body TEXT, urgent INTEGER)"
+        "date TEXT, body TEXT)"
     )
     return conn
 
 
-def upsert(mid, sender, subject, date, body, urgent):
+def upsert(mid, sender, subject, date, body):
     conn = _connect()
     try:
         conn.execute(
-            "INSERT OR REPLACE INTO messages VALUES (?, ?, ?, ?, ?, ?)",
-            (mid, sender, subject, date, body, int(bool(urgent))),
+            "INSERT OR REPLACE INTO messages (id, sender, subject, date, body) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (mid, sender, subject, date, body),
         )
         conn.commit()
+    finally:
+        conn.close()
+
+
+def known():
+    conn = _connect()
+    try:
+        return {row[0] for row in conn.execute("SELECT id FROM messages")}
+    finally:
+        conn.close()
+
+
+def count():
+    conn = _connect()
+    try:
+        return conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
     finally:
         conn.close()
 

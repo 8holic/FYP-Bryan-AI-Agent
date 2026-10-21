@@ -4,6 +4,7 @@ import email
 import getpass
 import html
 import imaplib
+import io
 import json
 import os
 import re
@@ -16,40 +17,60 @@ from . import store
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ENV_FILE = os.path.join(HERE, ".env")
-SEEN_FILE = os.path.join(HERE, ".gmail_seen.json")
 SUMMARY_FILE = os.path.join(HERE, ".mailbox_summary.md")
 
 _summary_lock = threading.Lock()
 _last_flush_date = None
+MARK_BATCH = 10
 
 
-def classify(model, sender, subject, body):
-    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
+def _log(msg):
+    print(f"{datetime.datetime.now().strftime('%H:%M:%S')} {msg}", flush=True)
+
+
+def classify(model, sender, subject, body, date=""):
+    llm.wait_for_user_idle()
+    now = datetime.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M %Z (%A)")
     prompt = (
         f"Current date and time: {now}\n"
-        "Is this email urgent for Bryan?\n"
-        "URGENT = needs immediate attention: a deadline within a day or two, security or account "
-        "alerts, payment or billing problems, a time-sensitive request from a real person, or "
-        "anything that loses money or an opportunity if missed.\n"
-        "NON-URGENT = newsletters, promotions, receipts, FYI, social notifications, routine updates.\n\n"
-        'Reply with JSON only: {"urgent": true or false}\n\n'
+        f"Email received: {date}\n"
+        "Decide two things about this email for Bryan.\n\n"
+        "Compare the current date and time with the email's received date and with any date, "
+        "time, or deadline it mentions.\n\n"
+        '"advertisement": true if the email is promoting an event, product, sale, or newsletter.\n'
+        '"urgent": true ONLY if Bryan must personally act within the next 48 hours and missing '
+        "it has a concrete cost: a hard deadline he committed to, a payment or billing problem, "
+        "a security or account alert, or a direct request from a real person waiting for his "
+        "reply. A near date alone does not make an email urgent. Optional lectures, talks, "
+        "seminars, webinars, info sessions, event invitations, surveys, sign-ups, and automated "
+        "reminders are NOT urgent, even if they are upcoming, today, or use words like 'urgent' "
+        "or 'last chance'. If the deadline or event has already passed, it is not urgent. "
+        "An advertisement is never urgent.\n\n"
+        'Reply with JSON only: {"advertisement": true or false, "urgent": true or false}\n\n'
         f"From: {sender}\nSubject: {subject}\n\n{body}"
     )
-    raw = llm.chat(model, prompt, fmt="json")
+    raw = llm.chat(model, prompt, fmt="json", think=False)
     try:
-        return bool(json.loads(raw).get("urgent"))
-    except (ValueError, AttributeError):
-        return False
+        data = json.loads(raw)
+        advertisement = bool(data.get("advertisement"))
+        urgent = bool(data.get("urgent")) and not advertisement
+    except (ValueError, TypeError, AttributeError):
+        return {"advertisement": False, "urgent": False}
+    return {
+        "advertisement": advertisement,
+        "urgent": urgent,
+    }
 
 
 def summarize(model, sender, subject, body):
+    llm.wait_for_user_idle()
     prompt = (
         "Summarize this email in 3-5 short sentences. Include what it is about and who it is from. "
         "Mention a deadline, date, or amount of money only if the email actually states one. "
         "Never say that no deadline, date, or amount was mentioned.\n\n"
         f"From: {sender}\nSubject: {subject}\n\n{body}"
     )
-    return llm.chat(model, prompt)
+    return llm.chat(model, prompt, think=False)
 
 
 def vision_read(model, sender, subject, images):
@@ -59,7 +80,7 @@ def vision_read(model, sender, subject, images):
         "or what a screenshot shows. Be factual and concise.\n\n"
         f"From: {sender}\nSubject: {subject}"
     )
-    return llm.chat(model, prompt, images=images)
+    return llm.chat(model, prompt, images=images, think=False)
 
 
 def notify(env, sender, subject, summary):
@@ -84,40 +105,50 @@ def digest(model, text):
         "list every email individually. Note anything time-sensitive and whether it has already "
         "passed. Keep it to a few lines.\n\n" + text[:12000]
     )
-    return llm.chat(model, prompt)
+    return llm.chat(model, prompt, think=False)
 
 
 def flush_summary(env, model):
     global _last_flush_date
     with _summary_lock:
         if not os.path.exists(SUMMARY_FILE):
+            _log("digest: queue empty")
             return False
         with open(SUMMARY_FILE, encoding="utf-8") as f:
             text = f.read().strip()
         if not text:
+            _log("digest: queue empty")
             return False
         # ponytail: one Telegram message, 4096-char cap; chunk or sendDocument if the digest exceeds it
+        _log(f"digest: summarizing {len(text)} chars of notes")
         llm.send(env["TELEGRAM_TOKEN"], env["TELEGRAM_CHAT_ID"], digest(model, text))
         os.remove(SUMMARY_FILE)
         _last_flush_date = datetime.date.today()
+        _log("digest: sent")
         return True
 
 
-IMAP_HOST = "imap.gmail.com"
-IMAP_PORT = 993
-IMAP_QUERY = "is:unread -category:promotions newer_than:1d"
+IMAP_HOST_DEFAULT = "imap.gmail.com"
+IMAP_PORT_DEFAULT = 993
 
 
 class LoginError(RuntimeError):
     pass
 
 
+def _credentials(env):
+    address = (env.get("IMAP_ADDRESS") or env.get("GMAIL_ADDRESS") or "").strip()
+    password = (env.get("IMAP_PASSWORD") or env.get("GMAIL_APP_PASSWORD") or "")
+    return address, password.replace(" ", "").strip()
+
+
 def _imap_connect(env):
-    address = env.get("GMAIL_ADDRESS", "").strip()
-    password = env.get("GMAIL_APP_PASSWORD", "").replace(" ", "").strip()
-    detail = (f"GMAIL_ADDRESS={len(address)} chars (has '@': {'@' in address}), "
-              f"GMAIL_APP_PASSWORD={len(password)} chars after removing spaces")
-    conn = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT, timeout=120)
+    host = env.get("IMAP_HOST", "").strip() or IMAP_HOST_DEFAULT
+    port = int(env.get("IMAP_PORT", "").strip() or IMAP_PORT_DEFAULT)
+    address, password = _credentials(env)
+    detail = (f"IMAP_ADDRESS={len(address)} chars (has '@': {'@' in address}), "
+              f"IMAP_PASSWORD={len(password)} chars after removing spaces")
+    conn = imaplib.IMAP4_SSL(host, port, timeout=120)
     try:
         try:
             conn.login(address, password)
@@ -125,8 +156,8 @@ def _imap_connect(env):
             raise
         except imaplib.IMAP4.error as e:
             raise LoginError(
-                f"Gmail rejected the login: {e}. {detail}. "
-                "Google app passwords are 16 characters and require 2-Step Verification.") from e
+                f"{host} rejected the login: {e}. {detail}. "
+                "Check the address, the password/app password, and that IMAP is enabled.") from e
     except Exception:
         try:
             conn.shutdown()
@@ -134,21 +165,6 @@ def _imap_connect(env):
             pass
         raise
     return conn
-
-
-def load_seen():
-    if os.path.exists(SEEN_FILE):
-        with open(SEEN_FILE, encoding="utf-8") as f:
-            return set(json.load(f))
-    return set()
-
-
-def save_seen(seen):
-    if len(seen) > 2000:
-        seen = set(sorted(seen)[-2000:])
-    with open(SEEN_FILE, "w", encoding="utf-8") as f:
-        json.dump(sorted(seen), f)
-    return seen
 
 
 def message_text(msg):
@@ -185,11 +201,16 @@ _ocr = None
 
 
 def ocr_images(msg):
+    return ocr_bytes(image_parts(msg))
+
+
+def ocr_bytes(data_list):
     global _ocr
-    data_list = image_parts(msg)
     if not data_list:
         return ""
     try:
+        import numpy as np
+        from PIL import Image
         from rapidocr_onnxruntime import RapidOCR
     except ImportError:
         print("rapidocr-onnxruntime not installed, skipping image OCR")
@@ -199,7 +220,8 @@ def ocr_images(msg):
     lines = []
     for data in data_list:
         try:
-            result, _ = _ocr(base64.b64decode(data))
+            img = Image.open(io.BytesIO(base64.b64decode(data))).convert("RGB")
+            result, _ = _ocr(np.array(img))
         except Exception as e:
             print(f"OCR error: {e}")
             continue
@@ -208,62 +230,111 @@ def ocr_images(msg):
     return "\n".join(lines)
 
 
-def poll_once_gmail(env, model):
-    seen = load_seen()
-    conn = _imap_connect(env)
+def _mark_ai_read(conn, uids, host):
+    seq = b",".join(uids)
     try:
-        conn.select("INBOX", readonly=True)
+        typ, data = conn.uid("STORE", seq, "+FLAGS", r"(\Seen)")
+        if typ != "OK":
+            _log(f"Mark-read error: {data}")
+            return False
+    except Exception as e:
+        _log(f"Mark-read error: {e}")
+        return False
+    try:
+        if host.lower().endswith("gmail.com"):
+            conn.uid("STORE", seq, "+X-GM-LABELS", '"AI Read"')
+        else:
+            conn.uid("STORE", seq, "+FLAGS", "(AIRead)")
+    except Exception as e:
+        _log(f"Tag error: {e}")
+    return True
+
+
+def poll_once_gmail(env, model):
+    host = env.get("IMAP_HOST", "").strip() or IMAP_HOST_DEFAULT
+    t_start = time.monotonic()
+    login_s = select_s = search_s = loop_s = 0.0
+    unread = skipped = processed = urgent = 0
+    conn = _imap_connect(env)
+    login_s = time.monotonic() - t_start
+    try:
+        t = time.monotonic()
+        conn.select("INBOX")
+        select_s = time.monotonic() - t
         _, data = conn.response("UIDVALIDITY")
         validity = data[0].decode() if data and data[0] else "0"
-        typ, data = conn.uid("SEARCH", None, "X-GM-RAW", f'"{IMAP_QUERY}"')
+        t = time.monotonic()
+        typ, data = conn.uid("SEARCH", None, "UNSEEN")
+        search_s = time.monotonic() - t
         if typ != "OK":
             raise RuntimeError(f"IMAP search failed: {data}")
-        for uid in (data[0].split() if data and data[0] else []):
+        uids = data[0].split() if data and data[0] else []
+        unread = len(uids)
+        t = time.monotonic()
+        known = store.known()
+        pending = []
+        for uid in reversed(uids):
             mid = f"uid:{validity}:{uid.decode()}"
-            if mid in seen:
+            if mid in known:
+                skipped += 1
                 continue
             typ, fetched = conn.uid("FETCH", uid, "(BODY.PEEK[])")
             if typ != "OK" or not fetched or not isinstance(fetched[0], tuple):
-                print(f"Fetch failed for {mid}")
+                _log(f"Fetch failed for {mid}")
                 continue
             msg = email.message_from_bytes(fetched[0][1], policy=policy.default)
             sender = str(msg.get("From", ""))
             subject = str(msg.get("Subject", ""))
             date = str(msg.get("Date", ""))
-            print(f"Reading email from {sender}: {subject}")
+            _log(f"Reading email from {sender}: {subject}")
             body = message_text(msg)[:4000]
             image_text = ocr_images(msg)
             if image_text:
                 body += "\n\n[Image text]\n" + image_text
             try:
-                urgent = classify(model, sender, subject, body)
+                result = classify(model, sender, subject, body, date)
             except Exception as e:
-                print(f"Classify failed for {mid} ({sender}): {e}")
+                _log(f"Classify failed for {mid} ({sender}): {e}")
                 raise
-            store.upsert(mid, sender, subject, date, body, urgent)
-            if urgent:
-                print(f"URGENT from {sender}: {subject}")
+            processed += 1
+            if result["urgent"]:
+                urgent += 1
+                _log(f"URGENT from {sender}: {subject}")
                 notify(env, sender, subject, summarize(model, sender, subject, body))
             else:
-                print(f"Queued for digest: {subject}")
+                _log(f"Queued for digest: {subject}")
                 append_summary(sender, subject, body)
-            seen.add(mid)
-            seen = save_seen(seen)
+            store.upsert(mid, sender, subject, date, body)
+            pending.append(uid)
+            if len(pending) >= MARK_BATCH:
+                if not _mark_ai_read(conn, pending, host):
+                    pending = []
+                    break
+                pending = []
+        if pending:
+            _mark_ai_read(conn, pending, host)
+        loop_s = time.monotonic() - t
     finally:
+        t = time.monotonic()
         try:
             conn.logout()
         except Exception:
             pass
+        logout_s = time.monotonic() - t
+        _log(f"poll: {unread} unread, {skipped} known, {processed} new, {urgent} urgent "
+             f"({time.monotonic() - t_start:.1f}s: login {login_s:.1f}, select {select_s:.1f}, "
+             f"search {search_s:.1f}, loop {loop_s:.1f}, logout {logout_s:.1f})")
 
 
 def ensure_email_env():
     env = llm.env_items(ENV_FILE)
     changed = False
-    for key, prompt in (
-        ("GMAIL_ADDRESS", "Gmail address: "),
-        ("GMAIL_APP_PASSWORD", "Gmail app password (16 characters, no spaces): "),
+    address, password = _credentials(env)
+    for key, prompt, have in (
+        ("IMAP_ADDRESS", "Email address: ", address),
+        ("IMAP_PASSWORD", "Email password or app password (no spaces): ", password),
     ):
-        if env.get(key):
+        if have:
             continue
         try:
             value = getpass.getpass(prompt) if key.endswith("PASSWORD") else input(prompt)
@@ -283,21 +354,28 @@ def ensure_email_env():
 def poll_gmail_once(env, model):
     try:
         poll_once_gmail(env, model)
+        return True
     except LoginError:
         raise
     except Exception as e:
-        print(f"Poll error: {e}")
+        _log(f"poll error: {e}")
+        return False
 
 
 def run_poller():
     global _last_flush_date
     warned = False
-    needed = ("GMAIL_ADDRESS", "GMAIL_APP_PASSWORD",
-              "TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID")
+    announced = False
+    needed = ("TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID")
     while True:
         env = llm.env_items(ENV_FILE)
         llm.load_env_file(ENV_FILE)
         missing = [k for k in needed if not env.get(k)]
+        address, password = _credentials(env)
+        if not address:
+            missing.append("IMAP_ADDRESS")
+        if not password:
+            missing.append("IMAP_PASSWORD")
         model = llm.OLLAMA_MODEL
         if not missing:
             try:
@@ -306,29 +384,37 @@ def run_poller():
                 available = []
             if model not in available and available:
                 if model:
-                    print(f"Model {model!r} is not installed; using {available[0]!r} instead")
+                    _log(f"model {model!r} is not installed; using {available[0]!r} instead")
                 model = available[0]
         if missing or not model:
             if not warned:
                 if missing:
-                    print(f"Mail poller waiting for .env entries: {', '.join(missing)}")
+                    _log(f"poller waiting for .env entries: {', '.join(missing)}")
                 if not model:
-                    print("Mail poller waiting for a model (start ollama or set OLLAMA_MODEL)")
+                    _log("poller waiting for a model (start ollama or set OLLAMA_MODEL)")
                 warned = True
             time.sleep(10)
             continue
         warned = False
+        poll_seconds = int(env.get("EMAIL_POLL_SECONDS", "300"))
+        host = env.get("IMAP_HOST", "").strip() or IMAP_HOST_DEFAULT
+        if not announced:
+            _log(f"poller ready: {host}, model {model}, every {poll_seconds}s, "
+                 f"{store.count()} messages in db")
+            announced = True
         try:
             poll_gmail_once(env, model)
         except LoginError as e:
-            print(f"Login failed: {e}", flush=True)
-            print("Stopping.", flush=True)
+            _log(f"login failed: {e}")
+            _log("stopping")
             os._exit(1)
         today = datetime.date.today()
         if datetime.datetime.now().hour >= 8 and _last_flush_date != today:
             try:
+                llm.wait_for_user_idle()
                 flush_summary(env, model)
             except Exception as e:
-                print(f"Summary flush error: {e}")
+                _log(f"summary flush error: {e}")
             _last_flush_date = today
-        time.sleep(int(env.get("EMAIL_POLL_SECONDS", "60")))
+        _log(f"next poll in {poll_seconds}s")
+        time.sleep(poll_seconds)

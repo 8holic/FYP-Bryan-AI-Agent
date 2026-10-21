@@ -23,6 +23,7 @@ def load_eml(path):
         msg = email.message_from_bytes(f.read())
     subject = msg["subject"] or ""
     sender = msg["from"] or ""
+    date = msg["date"] or ""
     body = ""
     images = []
     for part in msg.walk():
@@ -33,32 +34,26 @@ def load_eml(path):
             data = part.get_payload(decode=True) or b""
             if data:
                 images.append(base64.b64encode(data).decode())
-    return sender, subject, body, images
+    return sender, subject, date, body, images
 
 
 def ocr_images(b64_list):
-    from rapidocr_onnxruntime import RapidOCR
-
-    ocr = RapidOCR()
-    lines = []
-    for b in b64_list:
-        result, _ = ocr(base64.b64decode(b))
-        if result:
-            lines.extend(line[1] for line in result)
-    return "\n".join(lines)
+    return mail.ocr_bytes(b64_list)
 
 
-def report(title, model, sender, subject, body):
+def report(title, model, sender, subject, body, date=""):
     print(f"\n----- {title} -----")
     body = body[:4000]
     t = time.time()
     try:
-        urgent = mail.classify(model, sender, subject, body)
+        result = mail.classify(model, sender, subject, body, date)
         summary = mail.summarize(model, sender, subject, body)
     except Exception as e:
         print(f"FAILED: {e}")
         return
-    print(f"urgent: {urgent}  ->  {'NOTIFY immediately' if urgent else 'queue for digest'}")
+    print(f"advertisement: {result['advertisement']}  "
+          f"urgent: {result['urgent']}  ->  "
+          f"{'NOTIFY immediately' if result['urgent'] else 'queue for digest'}")
     print(f"summary ({time.time() - t:.1f}s):\n{summary}")
 
 
@@ -87,10 +82,11 @@ def main():
         print(f"WARNING: vision model {vision} is not installed; pull it first.")
 
     for path in paths:
-        sender, subject, body, images = load_eml(path)
+        sender, subject, date, body, images = load_eml(path)
         print("\n" + "=" * 70)
         print(f"file:  {os.path.basename(path)}")
         print(f"from:  {sender}")
+        print(f"date:  {date}")
         print(f"subj:  {subject}")
         print(f"body:  {len(body)} chars | images: {len(images)}")
         print("preview:", " ".join(body.split())[:300])
@@ -108,7 +104,7 @@ def main():
             except Exception as e:
                 print(f"OCR failed: {e}")
         body_ocr = body + ("\n[Image text]\n" + ocr_text if ocr_text else "")
-        report("TODAY: text + OCR", model, sender, subject, body_ocr)
+        report("TODAY: text + OCR", model, sender, subject, body_ocr, date)
 
         if used:
             vision_text = ""
@@ -121,7 +117,7 @@ def main():
             if vision_text:
                 print(f"({time.time() - t:.1f}s)\n{vision_text}")
                 body_vis = body + "\n[Image content]\n" + vision_text
-                report("VISION: text + vision", model, sender, subject, body_vis)
+                report("VISION: text + vision", model, sender, subject, body_vis, date)
 
 
 if __name__ == "__main__":
